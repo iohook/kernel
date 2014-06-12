@@ -1,0 +1,684 @@
+From 361c62e91fe7e8525c9f8585ba8f7ebae2440cc0 Mon Sep 17 00:00:00 2001
+From: Rui Wang <rui.y.wang@intel.com>
+Date: Tue, 15 Apr 2014 16:32:31 +0800
+Subject: [PATCH 4/5] I/O Hook: Override MSRs while triggering MCEs
+
+MSRs can be overriden by specifying a cpu id and an MSR number.
+
+        bash# echo "0:17a-8[4/4]ro" > msr
+
+would override MSR 0x17a on cpu0. Use 'all' as the cpu id to override
+the MSR on all CPUs. e.g. "all:17a-8[4/4]ro"
+
+When specifying the interrupt to be triggered, a positive number
+denotes an IRQ and a negative number denotes a vector, thus
+
+        bash# echo -18 > irq
+
+specifies that a machine check exception (int 18) will be triggered.
+
+Signed-off-by: Rui Wang <rui.y.wang@intel.com>
+---
+ Documentation/PCI/iohook.txt |   31 ++++++--
+ arch/x86/include/asm/msr.h   |  100 ++++++++++++++++++++-
+ arch/x86/lib/msr-smp.c       |   31 +++++++
+ drivers/misc/iohook/iohook.c |  195 +++++++++++++++++++++++++++++++++++++++---
+ include/linux/reg_ovrd.h     |    1 +
+ 5 files changed, 335 insertions(+), 23 deletions(-)
+
+diff --git a/Documentation/PCI/iohook.txt b/Documentation/PCI/iohook.txt
+index ae9b4ad..9b3f232 100644
+--- a/Documentation/PCI/iohook.txt
++++ b/Documentation/PCI/iohook.txt
+@@ -52,11 +52,12 @@ a directory subtree is created under /sys/kernel/debug/iohook
+ 
+ bash# cd /sys/kernel/debug/iohook
+ bash# ls
+-io  irq  mem  pciconf  trigger
++io  irq  mem  msr pciconf  trigger
+ 
+ Each file is used to manage a type of resource.
+ 'io' is used to add/show Register Overrides in IO port space.
+ 'mem' is used to add/show Register Overrides in memory space.
++'msr' is used to add/show Register Overrides in MSR space.
+ 'pciconf' is used to add/show Register Overrides in pci config space.
+ 'irq' is used to set the desired IRQ to be triggered via IPI.
+ 'trigger' is used to turn on/off the I/O Hook.
+@@ -74,8 +75,15 @@ for a Register Override in PCI config space, it's specified as:
+ 
+ 	domain|bus:dev.func+offset-length[value/mask]attribute
+ 
++for a Register Override in MSR space, it's specified as:
++
++	cpuid:regnum-length[value/mask]attribute
++
+ where
+ 	address - the 64bit address of the h/w register to be overridden
++	cpuid - the cpu on which the MSR specified by regnum is to be
++		overriden. Use 'all' as the cpuid to specify all cpus.
++	regnum - the MSR to be overriden.
+ 
+ 	length - the number of bytes affected. Affected here means that
+ 		 at least one bit in that byte is overridden. For 'length'
+@@ -124,24 +132,35 @@ The syntax is "domain|bus:dev.func+offset-length[value/mask]attribute"
+ The first register overrides only bit0 and the second register overrides the
+ first 2 bytes (mask == 0xffff), with an initial value of 0x0500.
+ 
++As another example, MSRs can be overriden by specifying a cpu id and an MSR
++number:
++
++bash# echo "0:17a-8[4/4]ro" > msr
++The above specifies that bit2 of MSR 0x17a on cpu0 is overriden as 1 (bit set).
++
+ Register Overrides are disabled when added. They can be enabled by using the
+ 'trigger' file. See below.
+ 
+ 2.3 Add IRQ and enable the Register Overrides
+ 
+-To specify an IRQ to be triggered via IPI, just echo the IRQ number in decimal
+-to the 'irq' file. For example:
++To specify an interrupt to be triggered via IPI, just echo the IRQ or vector
++number in decimal to the 'irq' file. A positive number denotes an IRQ and a
++negative number denotes a vector. For example:
+ 
+ bash# cd /sys/kernel/debug/iohook
+ bash# echo 9 > irq
+ This specifies that IRQ9 be triggered after the Register Overrides are enabled.
+ 
+-To enable the Register Overrides in the kernel:
++bash# echo -18 > irq
++specifies that a machine check exception(vector 18) will be triggered.
++
++Register Overrides are disabled after added. Use the 'trigger' file to enabled
++them all:
+ 
+ bash# echo 1 > trigger
+ 
+-This immediately enables all the Register Overrides and if an IRQ number was
+-specified, generate the IPI.
++This immediately enables all the Register Overrides and if an IRQ (or vector)
++number was specified, generate the IPI.
+ 
+ To disable the Register Overrides in the kernel:
+ 
+diff --git a/arch/x86/include/asm/msr.h b/arch/x86/include/asm/msr.h
+index de36f22..cfbfc91 100644
+--- a/arch/x86/include/asm/msr.h
++++ b/arch/x86/include/asm/msr.h
+@@ -57,7 +57,69 @@ static inline unsigned long long native_read_tscp(unsigned int *aux)
+ #define EAX_EDX_RET(val, low, high)	"=A" (val)
+ #endif
+ 
+-static inline unsigned long long native_read_msr(unsigned int msr)
++#if !defined(NO_IO_HOOK) && defined(CONFIG_IO_HOOK)
++#ifndef CC_HAVE_ASM_GOTO
++#error "gcc 4.5 feature CC_HAVE_ASM_GOTO is required"
++#endif
++struct static_key;
++#include <asm/jump_label.h>
++#include <linux/reg_ovrd.h>
++
++#define msr_read_ovrd(addr)	\
++{ \
++	u64 val;\
++	if (arch_static_branch(&ovrdhw_enabled)			\
++		&& !read_ovrd_common(OVRD_SPACE_MSR, (u64)addr,	\
++			sizeof(u64), &val, NULL))		\
++			return val;				\
++}
++
++#define msr_read_ovrd_safe(addr, err) \
++{ \
++	u64 val;\
++	if (arch_static_branch(&ovrdhw_enabled)) {		\
++		struct msr_regs_info rv;			\
++		/* Use rv.reg to tell from *_safe_regs() */	\
++		rv.regs = NULL;					\
++		if (!read_ovrd_common(OVRD_SPACE_MSR, (u64)addr,\
++			sizeof(u64), &val, &rv)) {		\
++			*err = rv.err;				\
++			return val;				\
++		}						\
++	}							\
++}
++#define msr_write_ovrd_safe(addr, low, high)			\
++{ \
++	u64 val;\
++	if (arch_static_branch(&ovrdhw_enabled)) {		\
++		struct msr_regs_info rv;			\
++		/* Use rv.reg to tell from *_safe_regs() */	\
++		rv.regs = NULL;					\
++		val = (low) | ((u64)(high) << 32);		\
++		if (!write_ovrd_common(OVRD_SPACE_MSR, addr,	\
++			sizeof(u64), &val, &rv))		\
++			return rv.err;				\
++	}							\
++}
++
++#define msr_write_ovrd(addr, low, high)				\
++{ \
++	u64 val;\
++	if (arch_static_branch(&ovrdhw_enabled)) {		\
++		val = (low) | ((u64)(high) << 32);		\
++		if (!write_ovrd_common(OVRD_SPACE_MSR, addr,	\
++			sizeof(u64), &val, NULL))		\
++			return;					\
++	}							\
++}
++#else /* CONFIG_IO_HOOK */
++#define msr_read_ovrd(addr)
++#define msr_read_ovrd_safe(addr, err)
++#define msr_write_ovrd(addr, low, high)
++#define msr_write_ovrd_safe(addr, low, high)
++#endif /* CONFIG_IO_HOOK */
++
++static inline unsigned long long native_do_read_msr(unsigned int msr)
+ {
+ 	DECLARE_ARGS(val, low, high);
+ 
+@@ -65,7 +127,14 @@ static inline unsigned long long native_read_msr(unsigned int msr)
+ 	return EAX_EDX_VAL(val, low, high);
+ }
+ 
+-static inline unsigned long long native_read_msr_safe(unsigned int msr,
++static inline unsigned long long native_read_msr(unsigned int msr)
++{
++
++	msr_read_ovrd(msr);
++	return native_do_read_msr(msr);
++}
++
++static inline unsigned long long native_do_read_msr_safe(unsigned int msr,
+ 						      int *err)
+ {
+ 	DECLARE_ARGS(val, low, high);
+@@ -81,14 +150,27 @@ static inline unsigned long long native_read_msr_safe(unsigned int msr,
+ 	return EAX_EDX_VAL(val, low, high);
+ }
+ 
+-static inline void native_write_msr(unsigned int msr,
++static inline unsigned long long native_read_msr_safe(unsigned int msr,
++						      int *err)
++{
++	msr_read_ovrd_safe(msr, err);
++	return native_do_read_msr_safe(msr, err);
++}
++
++static inline void native_do_write_msr(unsigned int msr,
+ 				    unsigned low, unsigned high)
+ {
+ 	asm volatile("wrmsr" : : "c" (msr), "a"(low), "d" (high) : "memory");
+ }
+ 
+-/* Can be uninlined because referenced by paravirt */
+-notrace static inline int native_write_msr_safe(unsigned int msr,
++static inline void native_write_msr(unsigned int msr,
++				    unsigned low, unsigned high)
++{
++	msr_write_ovrd(msr, low, high);
++	native_do_write_msr(msr, low, high);
++}
++
++static inline int native_do_write_msr_safe(unsigned int msr,
+ 					unsigned low, unsigned high)
+ {
+ 	int err;
+@@ -105,6 +187,14 @@ notrace static inline int native_write_msr_safe(unsigned int msr,
+ 	return err;
+ }
+ 
++/* Can be uninlined because referenced by paravirt */
++static inline int native_write_msr_safe(unsigned int msr,
++					unsigned low, unsigned high)
++{
++	msr_write_ovrd_safe(msr, low, high);
++	return native_do_write_msr_safe(msr, low, high);
++}
++
+ extern unsigned long long native_read_tsc(void);
+ 
+ extern int rdmsr_safe_regs(u32 regs[8]);
+diff --git a/arch/x86/lib/msr-smp.c b/arch/x86/lib/msr-smp.c
+index 518532e..6a5f177 100644
+--- a/arch/x86/lib/msr-smp.c
++++ b/arch/x86/lib/msr-smp.c
+@@ -128,6 +128,33 @@ void rdmsr_on_cpus(const struct cpumask *mask, u32 msr_no, struct msr *msrs)
+ }
+ EXPORT_SYMBOL(rdmsr_on_cpus);
+ 
++#if !defined(NO_IO_HOOK) && defined(CONFIG_IO_HOOK)
++
++#define rdmsr_safe_regs_ovrd(rv) \
++{ \
++	u64 val;\
++	if (arch_static_branch(&ovrdhw_enabled)) {		\
++		if (!read_ovrd_common(OVRD_SPACE_MSR, 0,	\
++			sizeof(u64), &val, rv))			\
++			return;					\
++	}							\
++}
++
++#define wrmsr_safe_regs_ovrd(rv) \
++{ \
++	u64 val;\
++	if (arch_static_branch(&ovrdhw_enabled)) {		\
++		if (!write_ovrd_common(OVRD_SPACE_MSR, 0,	\
++			sizeof(u64), &val, rv))			\
++			return;					\
++	}							\
++}
++
++#else
++#define rdmsr_safe_regs_ovrd(rv)
++#define wrmsr_safe_regs_ovrd(rv)
++#endif
++
+ /*
+  * wrmsr on a bunch of CPUs
+  *
+@@ -229,6 +256,8 @@ static void __rdmsr_safe_regs_on_cpu(void *info)
+ {
+ 	struct msr_regs_info *rv = info;
+ 
++	rdmsr_safe_regs_ovrd(rv);
++
+ 	rv->err = rdmsr_safe_regs(rv->regs);
+ }
+ 
+@@ -236,6 +265,8 @@ static void __wrmsr_safe_regs_on_cpu(void *info)
+ {
+ 	struct msr_regs_info *rv = info;
+ 
++	wrmsr_safe_regs_ovrd(rv);
++
+ 	rv->err = wrmsr_safe_regs(rv->regs);
+ }
+ 
+diff --git a/drivers/misc/iohook/iohook.c b/drivers/misc/iohook/iohook.c
+index 5584eb7..f81f553 100644
+--- a/drivers/misc/iohook/iohook.c
++++ b/drivers/misc/iohook/iohook.c
+@@ -22,6 +22,7 @@
+ #include <asm/hw_irq.h>
+ #include <linux/reg_ovrd.h>
+ #include <linux/pci.h>
++#include <linux/smp.h>
+ #include "iohook.h"
+ 
+ MODULE_LICENSE("GPL");
+@@ -35,6 +36,7 @@ static DEFINE_RAW_SPINLOCK(engine_lock);
+ LIST_HEAD(ovrd_io_reg_map);
+ LIST_HEAD(ovrd_mem_reg_map);
+ LIST_HEAD(ovrd_pci_conf_reg_map);
++LIST_HEAD(ovrd_msr_map);
+ 
+ struct static_key ovrdhw_enabled = STATIC_KEY_INIT_FALSE;
+ EXPORT_SYMBOL(ovrdhw_enabled);
+@@ -52,8 +54,10 @@ struct reg_ovrd *iohook_query_ovrd(int spaceid, int idx)
+ 		reg_ovrd = &ovrd_mem_reg_map;
+ 	else if (spaceid == OVRD_SPACE_IO)
+ 		reg_ovrd = &ovrd_io_reg_map;
+-	else
++	else if (spaceid == OVRD_SPACE_PCICONF)
+ 		reg_ovrd = &ovrd_pci_conf_reg_map;
++	else
++		reg_ovrd = &ovrd_msr_map;
+ 
+ 	regentry = NULL;
+ 	raw_spin_lock_irqsave(&io_hook_lock, lock_flags);
+@@ -80,8 +84,10 @@ void iohook_cleanup_ovrd(int spaceid)
+ 		ovrd_list = &ovrd_mem_reg_map;
+ 	else if (spaceid == OVRD_SPACE_IO)
+ 		ovrd_list = &ovrd_io_reg_map;
+-	else
++	else if (spaceid == OVRD_SPACE_PCICONF)
+ 		ovrd_list = &ovrd_pci_conf_reg_map;
++	else
++		ovrd_list = &ovrd_msr_map;
+ 
+ 	list_for_each_safe(tmp, next, ovrd_list) {
+ 		struct reg_ovrd *ovrdreg =
+@@ -103,8 +109,10 @@ void iohook_add_ovrd(int spaceid, u64 address, u64 value, u64 mask,
+ 		reg_ovrd = &ovrd_mem_reg_map;
+ 	else if (spaceid == OVRD_SPACE_IO)
+ 		reg_ovrd = &ovrd_io_reg_map;
+-	else
++	else if (spaceid == OVRD_SPACE_PCICONF)
+ 		reg_ovrd = &ovrd_pci_conf_reg_map;
++	else
++		reg_ovrd = &ovrd_msr_map;
+ 
+ 	raw_spin_lock_irqsave(&io_hook_lock, lock_flags);
+ 	list_for_each_entry(ovrdreg, reg_ovrd, node) {
+@@ -353,6 +361,20 @@ int read_ovrd_common(int spaceid, u64 address, int len, void *value, void *bus)
+ 		devfn = PCI_DECODE_DEVFN(address);
+ 		pos = PCI_DECODE_POS(address);
+ 		ovrd_list = &ovrd_pci_conf_reg_map;
++	} else if (spaceid == OVRD_SPACE_MSR) {
++		unsigned int cpuid;
++
++		ovrd_list = &ovrd_msr_map;
++		cpuid = smp_processor_id();
++
++		/*
++		 * MSRs are 64bit wide, so x8 to form a contiguous
++		 * address space
++		 */
++		address *= 8;
++
++		/* upper 32bits contain the cpu id */
++		address |= (u64)cpuid << 32;
+ 	} else {
+ 		return ret;
+ 	}
+@@ -392,6 +414,29 @@ int read_ovrd_common(int spaceid, u64 address, int len, void *value, void *bus)
+ 				res = pcib->ops->read(pcib, devfn, pos, len,
+ 							(u32 *)&data);
+ 				raw_spin_unlock_irqrestore(&pci_lock, flags);
++			} else if (spaceid == OVRD_SPACE_MSR) {
++				struct msr_regs_info *rv;
++				unsigned int msr;
++
++				rv = (struct msr_regs_info *)bus;
++				msr = address & 0xffffffff;
++				if (rv && rv->regs) { /* rdmsr_safe_regs() */
++					u32 low, high;
++
++					rv->err = rdmsr_safe_regs(rv->regs);
++					low = rv->regs[0]; /* eax */
++					high = rv->regs[2]; /* edx */
++					data = low | ((u64)high << 32);
++					res = rv->err;
++				} else if (rv) { /* rv->regs == NULL */
++					data = native_do_read_msr_safe(msr,
++						&rv->err);
++					res = rv->err;
++				} else { /* rv == NULL */
++					data = native_do_read_msr(msr);
++					res = 0;
++				}
++
+ 			} else
+ 				goto out;
+ 
+@@ -486,6 +531,20 @@ int write_ovrd_common(int spaceid, u64 address, int len, void *data, void *bus)
+ 		devfn = PCI_DECODE_DEVFN(address);
+ 		pos = PCI_DECODE_POS(address);
+ 		ovrd_list = &ovrd_pci_conf_reg_map;
++	} else if (spaceid == OVRD_SPACE_MSR) {
++		unsigned int cpuid;
++
++		cpuid = smp_processor_id();
++
++		/*
++		 * MSRs are 64bit wide, so x8 to form a contiguous
++		 * address space
++		 */
++		address *= 8;
++
++		/* upper 32bits contain the cpu id */
++		address |= (u64)cpuid << 32;
++		ovrd_list = &ovrd_msr_map;
+ 	} else {
+ 		return ret;
+ 	}
+@@ -525,6 +584,23 @@ int write_ovrd_common(int spaceid, u64 address, int len, void *data, void *bus)
+ 				raw_spin_unlock_irqrestore(&pci_lock, flags);
+ 				raw_spin_lock_irqsave(&io_hook_lock,
+ 					lock_flags);
++			} else if (spaceid == OVRD_SPACE_MSR) {
++				struct msr_regs_info *rv;
++				unsigned int msr, low, high;
++
++				rv = (struct msr_regs_info *)bus;
++				msr = address & 0xffffffff;
++				low = value & 0xffffffff;
++				high = value >> 32;
++
++				if (rv && rv->regs) { /* wrmsr_safe_regs() */
++					rv->err = wrmsr_safe_regs(rv->regs);
++				} else if (rv) { /* rv->regs == NULL */
++					rv->err = native_do_write_msr_safe(msr,
++						low, high);
++				} else { /* rv == NULL */
++					native_do_write_msr(msr, low, high);
++				}
+ 			} else
+ 				break;
+ 		}
+@@ -566,12 +642,22 @@ int write_ovrd_common(int spaceid, u64 address, int len, void *data, void *bus)
+ }
+ EXPORT_SYMBOL(write_ovrd_common);
+ 
+-static void trigger_irq_by_ipi(unsigned long irqnum)
++static void trigger_irq_by_ipi(long irqnum)
+ {
+ 	struct irq_desc *desc;
+ 	struct irq_data *data;
+ 	struct irq_chip *chip;
+ 
++	if (irqnum < 0) { /* vector number */
++		pr_info("sending IPI to vector:%ld\n", -irqnum);
++		if (-irqnum == 18)
++			apic->send_IPI_all(-irqnum);
++		else
++			apic->send_IPI_self(-irqnum);
++		pr_info("Returned from sending IPI to vector:%ld\n", -irqnum);
++		return;
++	}
++
+ 	desc = irq_to_desc(irqnum);
+ 	data = irq_desc_get_irq_data(desc);
+ 	chip = irq_data_get_irq_chip(data);
+@@ -637,7 +723,11 @@ ssize_t hook_irq_read(struct file *file, char __user *ubuf, size_t cnt,
+ 	char buf[64];		/* big enough to hold a number */
+ 	int r;
+ 
+-	r = sprintf(buf, "%u\n", g_irq_num);
++	if (g_irq_num >= 0)
++		r = sprintf(buf, "irq:%u\n", g_irq_num);
++	else
++		r = sprintf(buf, "vector:%u\n", -g_irq_num);
++
+ 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
+ }
+ 
+@@ -645,7 +735,7 @@ static ssize_t hook_irq_write(struct file *file, const char __user *user_buf,
+ 			size_t count, loff_t *ppos)
+ {
+ 	char *irq = NULL;
+-	unsigned long irqnum, ret;
++	long irqnum, ret;
+ 
+ 	irq = kmalloc(count+1, GFP_ATOMIC);
+ 	if (!irq) {
+@@ -655,13 +745,19 @@ static ssize_t hook_irq_write(struct file *file, const char __user *user_buf,
+ 	irq[count] = '\0';
+ 	if (copy_from_user(irq, user_buf, count))
+ 		goto end;
+-	ret = kstrtoul(irq, 10, &irqnum);
++
++	ret = kstrtol(irq, 10, &irqnum);
+ 	if (ret) {
+-		pr_err("bogus irq number? %s\n", irq);
++		pr_err("bogus irq/vector number? %s\n", irq);
+ 		goto end;
+ 	}
+-	if (irqnum > NR_IRQS) {
+-		pr_err("irq num too big: %lu\n", irqnum);
++
++	/*
++	 * if irqnum < 0 it's a vector number
++	 * if irqnum > 0 it's a IRQ number
++	 */
++	if (irqnum <= -NR_VECTORS || irqnum >= NR_IRQS) {
++		pr_err("irq/vector num too big: %ld\n", irqnum);
+ 		goto end;
+ 	}
+ 
+@@ -733,6 +829,13 @@ hook_seq_show(struct seq_file *s, void *it)
+ 			regmap->address, regmap->length, regmap->val,
+ 			regmap->bit_mask, hook_attrib(regmap->attrib));
+ 		break;
++	case OVRD_SPACE_MSR:
++		seq_printf(s,
++			"cpu%d msr: 0x%x length: 0x%x value: 0x%llx mask: 0x%llx attrib: %s\n",
++			(u32)(regmap->address >> 32), (u32)(regmap->address)/8,
++			regmap->length, regmap->val, regmap->bit_mask,
++			hook_attrib(regmap->attrib));
++		break;
+ 	case OVRD_SPACE_PCICONF:
+ 		seq_printf(s,
+ 			"pciconf: 0x%04x|%02x:%02x.%02x offset: 0x%x lenght: 0x%x value: 0x%llx mask: 0x%llx attrib: %s\n",
+@@ -772,6 +875,19 @@ hook_io_open(struct inode *inode, struct file *file)
+ }
+ 
+ static int
++hook_msr_open(struct inode *inode, struct file *file)
++{
++	struct hook_iter *iter;
++
++	iter = __seq_open_private(file, &hook_seq_ops,
++				sizeof(struct hook_iter));
++	if (iter)
++		iter->spaceid = OVRD_SPACE_MSR;
++
++	return iter ? 0 : -ENOMEM;
++}
++
++static int
+ hook_mem_open(struct inode *inode, struct file *file)
+ {
+ 	struct hook_iter *iter;
+@@ -817,12 +933,12 @@ hook_parse_entry(char *entry, int spaceid)
+ {
+ 	char *field;
+ 	u64 address, length, value, mask;
+-	unsigned long domain, bus, dev, func;
++	unsigned long domain, bus, dev, func, cpu;
+ 	int attrib, ret;
+ 	u16 cval;
+ 
+ 	if (spaceid != OVRD_SPACE_PCICONF)
+-		goto mem_io;
++		goto msr;
+ 
+ 	field = strsep(&entry, "|");
+ 	ret = kstrtoul(field, 16, &domain);
+@@ -843,6 +959,20 @@ hook_parse_entry(char *entry, int spaceid)
+ 	ret = kstrtoul(field, 16, &func);
+ 	if (ret || !entry)
+ 		return -1;
++msr:
++	if (spaceid != OVRD_SPACE_MSR)
++		goto mem_io;
++	field = strsep(&entry, ":");
++	if (strcasecmp(field, "all") == 0) {
++		/* All cpus */
++		cpu = (unsigned long)-1;
++		ret = 0;
++	} else {
++		ret = kstrtoul(field, 16, &cpu);
++	}
++	pr_info("parse_hook_entry() cpu=0x%lx\n", cpu);
++	if (ret || !entry)
++		return -1;
+ 
+ mem_io:
+ 	field = strsep(&entry, "-");
+@@ -850,6 +980,13 @@ mem_io:
+ 	if (ret || !entry)
+ 		return -1;
+ 
++	/*
++	 * MSRs are 64bit wide, so x8 to form a contiguous
++	 * address space
++	 */
++	if (spaceid == OVRD_SPACE_MSR)
++		address *= 8;
++
+ 	pr_info("parse_hook_entry() address=0x%llx\n", address);
+ 
+ 	field = strsep(&entry, "[");
+@@ -888,6 +1025,17 @@ mem_io:
+ 	if (spaceid == OVRD_SPACE_PCICONF) {
+ 		address = PCI_ENCODE_ADDR(domain, bus, PCI_DEVFN(dev, func),
+ 			address);
++	} else if (spaceid == OVRD_SPACE_MSR) {
++		if (cpu == (unsigned long)-1) { /* all cpus */
++			for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
++				address &= 0xffffffff;
++				address |= cpu << 32;
++				iohook_add_ovrd(spaceid, address, value, mask,
++					length, attrib);
++			}
++			return 0;
++		}
++		address |= cpu << 32;
+ 	}
+ 
+ 	iohook_add_ovrd(spaceid, address, value, mask, length, attrib);
+@@ -945,6 +1093,14 @@ hook_io_write(struct file *file, const char __user *user_buf,
+ }
+ 
+ static ssize_t
++hook_msr_write(struct file *file, const char __user *user_buf,
++		 size_t user_len, loff_t *offset)
++{
++
++	return hook_write(file, user_buf, user_len, offset, OVRD_SPACE_MSR);
++}
++
++static ssize_t
+ hook_mem_write(struct file *file, const char __user *user_buf,
+ 		 size_t user_len, loff_t *offset)
+ {
+@@ -968,6 +1124,14 @@ static const struct file_operations hook_io_fops = {
+ 	.write = hook_io_write,
+ };
+ 
++static const struct file_operations hook_msr_fops = {
++	.open = hook_msr_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release_private,
++	.write = hook_msr_write,
++};
++
+ static const struct file_operations hook_mem_fops = {
+ 	.open = hook_mem_open,
+ 	.read = seq_read,
+@@ -1007,11 +1171,18 @@ static int __init iohook_init(void)
+ 	if (hook_irq_dentry == NULL)
+ 		return -ENODEV;
+ 
++#ifdef CONFIG_X86
+ 	hook_reg_dentry = debugfs_create_file("io", S_IWUSR,
+ 				root, NULL, &hook_io_fops);
+ 	if (hook_reg_dentry == NULL)
+ 		return -ENODEV;
+ 
++	hook_reg_dentry = debugfs_create_file("msr", S_IWUSR,
++				root, NULL, &hook_msr_fops);
++	if (hook_reg_dentry == NULL)
++		return -ENODEV;
++#endif
++
+ 	hook_reg_dentry = debugfs_create_file("mem", S_IWUSR,
+ 				root, NULL, &hook_mem_fops);
+ 	if (hook_reg_dentry == NULL)
+diff --git a/include/linux/reg_ovrd.h b/include/linux/reg_ovrd.h
+index 2707d6c..ce655fe 100644
+--- a/include/linux/reg_ovrd.h
++++ b/include/linux/reg_ovrd.h
+@@ -37,6 +37,7 @@ struct reg_ovrd {
+ #define	OVRD_SPACE_IO		0
+ #define	OVRD_SPACE_MEM		1
+ #define	OVRD_SPACE_PCICONF	2
++#define	OVRD_SPACE_MSR		3
+ 
+ #define	PCI_ENCODE_ADDR(domain, bus, devfn, pos)	\
+ 		(((u64)(domain))<<32|(bus)<<20|(devfn)<<12|(pos))
+-- 
+1.7.5.4
+
